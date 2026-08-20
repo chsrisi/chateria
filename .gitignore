@@ -5,3 +5,6 @@ dist/
 .DS_Store
 *~
 .*.un~
+out/
+dist-electron/
+release/

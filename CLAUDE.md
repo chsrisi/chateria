@@ -5,106 +5,154 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-docker compose up --build          # full stack: db (5432), api (3000), web (5173)
+docker compose up -d                  # PostgreSQL 18.4 (nothing else runs in Docker)
+npm install                           # npm workspaces; installs all three packages
+npm run dev                           # both Electron apps together
+npm run dev:server                    # server app only
+npm run dev:client                    # client app only
+npm run typecheck                     # tsc across every workspace
+npm test                              # unit tests in both apps, no database needed
+npm run test:e2e                      # end-to-end contract, needs the database up
+npm run build                         # electron-vite build for both apps
 ```
 
-API (`api/`, no build step):
+Single test file / single test:
 
 ```sh
-npm run dev                        # node --watch src/server.js
-npm test                           # node --test -> runs api/test/*.test.js only
-node --test test/contract.test.js  # single unit test file
-node test/integration.mjs          # end-to-end smoke test; NOT part of `npm test`
+node --test packages/server/test/auth.test.ts
+node --test --test-name-pattern "alg confusion" packages/server/test/auth.test.ts
 ```
 
-`api/test/integration.mjs` is a bare assertion script, not a `node:test` suite. It needs a
-running API + database and talks to `TEST_API_URL` (default `http://127.0.0.1:3000/api`) and
-`TEST_WS_URL` (default `ws://127.0.0.1:3000/ws`). It registers users with a timestamp suffix,
-so it is safe to re-run against a live dev database.
+Tests are plain `.ts` run through **Node's native type stripping** — there is no
+compile step and no test framework beyond `node:test`. Each `test/` directory has
+its own `package.json` containing only `{"type":"module"}`: the app packages must
+stay CommonJS for electron-vite's `externalizeDepsPlugin`, but the test files are
+ESM. The `--disable-warning=MODULE_TYPELESS_PACKAGE_JSON` flag in the test scripts
+silences the resulting reparse warning; keep it when editing those scripts.
 
-Web (`web/`): `npm run dev`, `npm run build`, `npm run preview`. There is no web test suite and
-no linter configured anywhere in the repo.
+`test:e2e` boots the real Express + WebSocket + Postgres stack in-process via
+`createApiRuntime` — no Electron involved. Override the database with
+`CHATERIA_DATABASE_URL`, the port with `TEST_API_PORT`, and see server logs with
+`TEST_VERBOSE=1`.
 
-Running the web dev server outside Docker requires overriding the proxy targets, which default
-to the compose service hostname `api`:
+## Layout
 
-```sh
-VITE_API_PROXY_TARGET=http://127.0.0.1:3000 VITE_WS_PROXY_TARGET=ws://127.0.0.1:3000 npm run dev
-```
+Three workspaces under `packages/`:
+
+- **`protocol`** — the wire contract. Plain TypeScript with **no build step**:
+  `main`/`types` point straight at `src/index.ts`, and it sits in each app's
+  `devDependencies` so electron-vite bundles it from source instead of
+  externalising it. Both `electron.vite.config.ts` files also alias it explicitly.
+  Changing an event shape here breaks compilation on whichever side lags.
+- **`server`** — Electron app that *hosts* the backend. `src/main/api/` is the
+  entire backend and imports no Electron API, which is why the E2E test can drive
+  it headlessly.
+- **`client`** — Electron chat app. All server state lives in one zustand store.
 
 ## Architecture
 
-Two independent npm packages, both ESM, both Node >= 20, sharing no code. The browser talks to
-same-origin `/api` and `/ws`; Vite proxies both to the API container. `VITE_API_URL` /
-`VITE_WS_URL` override that with absolute origins.
+### The backend is a library the desktop shell drives
 
-### API (`api/src/`)
+`createApiRuntime(keyDirectory, log)` in `src/main/api/server.ts` returns
+`start` / `stop` / `stats` / `rotate`. The Electron main process owns lifecycle,
+settings, and the log ring buffer; it never reaches into request handling.
 
-`server.js` builds one `http.Server` shared by Express and the WebSocket server, then
-`waitForDatabase()` (30 × 1s retry) and `migrate()` before listening.
+`rotate()` deliberately stops and restarts a running server: the router and hub
+captured the previous `SigningKeys` object, so swapping the variable alone would
+leave the live server verifying against the retired public key.
 
-- `db.js` — the entire schema is one idempotent `CREATE TABLE IF NOT EXISTS` string applied on
-  every boot inside a transaction guarded by `pg_advisory_lock(73918421)`, so concurrent API
-  instances can't race. There are no migration files; **schema changes mean editing that string
-  in a backwards-compatible way** (existing tables are never altered by it).
-- `auth.js` — throws at *import* time if `JWT_SECRET` is unset, so the process refuses to boot.
-  HS256 only, on both sign and verify.
-- `routes.js` — module-level `express.Router()` singleton. `createRouter(presence)` exists only
-  to inject the in-memory presence map into `GET /api/presence`; calling it twice would register
-  that route twice. It also exports `memberOfRoom` / `dmParticipant`, which `websocket.js`
-  imports — authorization logic lives here and is shared with the realtime layer.
-- `websocket.js` — `createRealtime(server)` attaches an `upgrade` handler that requires
-  `/ws?token=<jwt>`; a bad token gets close code **4401** (the client treats it as "log out"),
-  a wrong path gets the socket destroyed.
+### Dependency direction (this is what the v1 rewrite fixed)
 
-Realtime rules that are easy to break:
+`queries.ts` holds every shared DB helper — `memberOfRoom`, `dmParticipant`,
+`insertMessage`, `messagePage`, the DM summary SQL. Both `routes.ts` and
+`realtime.ts` import it and **neither imports the other**. In the old JavaScript
+version the WebSocket module imported authorization helpers back out of the
+router, which forced the router to be a module-level singleton. Do not reintroduce
+that edge; put anything both layers need into `queries.ts`.
 
-- **Writes are serialized twice**: each socket has an `operationQueue`, and all `message:send`
-  work additionally funnels through a single process-wide `messageQueue`, so message IDs and
-  broadcast order stay consistent.
-- **Room delivery requires membership AND an active `room:subscribe`.** DM delivery requires
-  only that the client's user is one of the two participants — DMs are not subscribed to.
-- Presence is a process-local `Map` of userId → open connection count. Multi-instance deploys
-  would need a shared adapter. `presence:update` is broadcast to *all* clients.
-- `typing` is fire-and-forget to room subscribers except the sender; nothing is persisted.
+`createRouter({ pool, keys, hub, config })` takes the hub, which is how REST
+mutations broadcast.
 
-Data model invariants enforced in SQL, not just in code: `messages` has a CHECK that exactly one
-of `room_id`/`conversation_id` is set; `dm_conversations` has `CHECK (user_one_id < user_two_id)`
-plus a unique pair constraint, so `POST /api/dms` normalizes the pair with min/max and upserts.
+### Broadcasts are the point
 
-Pagination is keyset on `messages.id` (`WHERE id < $before ORDER BY id DESC LIMIT limit+1`),
-served through partial indexes per destination type. Responses are reversed to oldest-to-newest;
-`nextCursor` is the id of the *first* (oldest) returned message, or null.
+REST handlers emit WebSocket events so clients never refetch after a mutation:
+`room:created`, `room:member_joined`, `room:member_left`, `dm:created`,
+`user:registered`. Two rules that the E2E test pins down:
 
-### Web (`web/src/App.jsx`)
+- Membership events fire **only on a real change** — guarded by `rowCount` from
+  the `ON CONFLICT DO NOTHING` insert and the `DELETE`. A repeat join is silent.
+- `dm:created` is rendered **once per recipient**, because each participant's
+  `otherUser` is the other person. `INSERT ... RETURNING (xmax = 0) AS created`
+  distinguishes a real insert from an upsert of an existing pair.
 
-The whole client is one file: `App`, `Auth`, `Sidebar`, `Chat`, and two modals. All state lives
-in `App` — no router, no state library. The session (`{token, user}`) is persisted to
-`localStorage` under `chateria-session`.
+Delivery asymmetry, easy to break: room messages require membership **and** an
+active `room:subscribe`; DM messages require only participation (there is no DM
+subscribe step).
 
-- One WebSocket for the session, recreated by a `connect()` closure with a 1200ms reconnect
-  timer; close code 4401 logs out instead of reconnecting. On reopen it re-sends
-  `room:subscribe` for the active room.
-- `activeRef` / `peopleRef` mirror state because the long-lived `ws.onmessage` closure would
-  otherwise capture stale values. Keep that pattern when adding frame handlers.
-- Sent messages are **not** optimistically rendered; they appear when the server echoes
-  `message:new`. The reducer de-dupes by message id.
-- `Chat` manages scroll manually via three `useLayoutEffect`s keyed on `active.id`, `lastId`,
-  and `firstId`: switching conversations jumps to the bottom, new messages only auto-scroll when
-  the user was already pinned to the bottom, and prepending older pages restores the previous
-  offset by diffing `scrollHeight`.
-- Components carry `data-testid` attributes throughout; external E2E tooling depends on them, so
-  preserve existing ids when editing markup.
+### Message ordering
+
+Every `message:send` passes through a per-connection `queue` and then a single
+process-wide `writeChain`. Without the second one, concurrent senders could commit
+in one order and broadcast in another, so replayed history would not match what
+people saw live.
+
+### Auth
+
+ES256 only. `keys.ts` persists an ECDSA P-256 pair as PEM in the app's `userData`
+(private key mode `0o600`); `auth.ts` signs with `jose` and verifies with
+`algorithms: ['ES256']` plus issuer `chateria-server` and audience
+`chateria-client` — that pinning is what rejects `alg: none` and confusion
+attacks, so do not loosen it. The public JWK is served at
+`/.well-known/jwks.json`.
+
+Passwords use `node:crypto` scrypt encoded as `scrypt$<salt-b64>$<hash-b64>`.
+The scheme prefix exists so the format can change later. Avoid native hashing
+modules here: they would need an Electron rebuild step.
+
+Untrusted input is parsed, not cast — `frames.ts` holds the zod schemas for every
+WebSocket frame and REST body.
+
+### Client state
+
+`src/renderer/src/store.ts` is one zustand store plus `applyServerEvent`, the
+single reducer for everything the server pushes. Components subscribe with
+selectors; `App.tsx` holds an `activeRef` mirror because the long-lived socket
+callbacks would otherwise capture stale state.
+
+`realtime.ts` owns one socket with exponential backoff and **re-sends
+`room:subscribe` on every reconnect** — subscriptions are per-connection server
+state and do not survive a drop. Close code `4401` signs out instead of retrying.
+
+Sent messages are not rendered optimistically; the sender's own `message:new`
+carries back `clientNonce` if reconciliation is ever added.
+
+## Constraints worth knowing
+
+- **electron-vite 5 does not support Vite 8**, and `@vitejs/plugin-react` 6
+  requires Vite 8. The working combination is pinned: Vite 7 + plugin-react 5.
+  Bumping either alone breaks `npm install`.
+- Electron 43 has **no postinstall**; it downloads its binary lazily on first
+  `require('electron')`.
+- The app packages must **not** get `"type": "module"` — electron-vite builds the
+  main and preload bundles as CommonJS with dependencies externalised.
+- `main` process code must avoid ESM-only dependencies for the same reason. That
+  is why `settings.ts` and `vault.ts` are hand-rolled instead of using
+  `electron-store`.
+- Postgres 18 images put PGDATA in `/var/lib/postgresql/18/docker` and want the
+  volume on `/var/lib/postgresql`. Compose uses `postgres_data_v18`; the old
+  `chateria_postgres_data` volume still holds PostgreSQL 16 data and will make
+  the 18 container refuse to start if remounted.
+- Schema changes go in the `SCHEMA` string in `db.ts`, applied idempotently under
+  advisory lock `73918421` on every start. There are no migration files, so
+  statements must stay backwards compatible — existing tables are never altered.
 
 ## Conventions
 
-- Route handlers use `try/catch` with `return next(error)`; the error middleware in `server.js`
-  maps `entity.too.large` → 413 and JSON `SyntaxError` → 400, everything else → 500.
-- IDs come out of Postgres as strings — `format.js` (`messageFromRow`, `parsePositiveId`,
-  `pagination`) is the single place that normalizes them to numbers and timestamps to ISO. Use
-  it rather than hand-shaping rows.
-- `README.md` documents the intended product behavior (case-sensitive usernames, duplicate room
-  names allowed, idempotent joins, whitespace trimming, 30s presence bound). Treat it as the
-  spec when changing semantics.
-- Stray editor backups (`*~`, `.*.un~`) exist on disk under `api/` and `web/`; they are
-  gitignored, so don't treat them as source.
+- Express 5 forwards async rejections automatically; handlers `throw` and let the
+  error middleware in `server.ts` map them (`entity.too.large` → 413, JSON
+  `SyntaxError` → 400, everything else → 500). Only catch what you will translate,
+  as `/auth/register` does for unique-violation `23505`.
+- `format.ts` is the single place pg rows become wire types. `db.ts` installs an
+  INT8 parser so BIGINT ids arrive as numbers rather than strings.
+- `README.md` documents intended product behaviour; treat it as the spec when
+  changing semantics.
